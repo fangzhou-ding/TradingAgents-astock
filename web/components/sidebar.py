@@ -32,6 +32,33 @@ _LLM_CONFIG_PATH = Path(os.path.expanduser("~")) / ".tradingagents" / "llm_confi
 # 恢复时必须写这个索引，只写派生值 subscription_scope 会在渲染时被覆盖回默认。
 _SCOPE_VALUES = ["off", "deep", "all"]
 
+# ── API Key：在网页里填写并落到本机 ─────────────────────────────────────────
+# 各 LLM 客户端读 key 的顺序是「显式 api_key 参数 → 该 provider 自己的环境变量」，
+# 所以 Web 侧唯一可靠且对所有 provider 通用的注入点就是**环境变量**：把用户在页面上
+# 填的 key 写进 os.environ，客户端下次建实例时自然读到。
+# 单独存 secrets.json 而不是塞进 llm_config.json：这个文件是明文凭据，权限收紧到
+# 0600，且与模型选择等非敏感配置分开，便于单独删除/备份。
+_SECRETS_PATH = Path(os.path.expanduser("~")) / ".tradingagents" / "secrets.json"
+
+# provider → 该 provider 客户端实际读取的环境变量名（与 llm_clients 保持一致）。
+# ollama 为 None，本地模型不需要 key。
+_PROVIDER_KEY_ENV: dict[str, str | None] = {
+    "minimax": "MINIMAX_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "qwen": "DASHSCOPE_API_KEY",
+    "glm": "ZHIPU_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "google": "GOOGLE_API_KEY",
+    "xai": "XAI_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+    "openai_compatible": "OPENAI_COMPATIBLE_API_KEY",
+    "ollama": None,
+}
+
+# 输出语言选项（index 持久化，selectbox 的 key 是 widget 键）
+OUTPUT_LANGUAGES = ["Chinese", "English"]
+
 # `MODEL_OPTIONS` 里每个供应商都带一条哨兵项 `("Custom model ID", "custom")`，含义是
 # "自己填模型 ID"。CLI 会就此追问输入（cli/utils.py::_select_model），Web 却把这个
 # 字符串**当成模型名直接发给 API**，于是用户拿到的是一句看不懂的服务端错误：
@@ -111,6 +138,16 @@ def _load_saved_llm_config() -> None:
     for key in ("custom_quick_model", "custom_deep_model"):
         if key in cfg and cfg[key]:
             st.session_state.setdefault(key, cfg[key])
+    # 高级参数（v0.5.22）：缺省值与 DEFAULT_CONFIG 对齐，老配置文件没有这些键也能正常开。
+    st.session_state.setdefault("cfg_max_tokens", cfg.get("max_tokens", 0))
+    st.session_state.setdefault("cfg_debate_rounds", cfg.get("max_debate_rounds", 1))
+    st.session_state.setdefault("cfg_risk_rounds", cfg.get("max_risk_discuss_rounds", 1))
+    st.session_state.setdefault("cfg_llm_timeout", cfg.get("llm_timeout", 150))
+    lang = cfg.get("output_language", "Chinese")
+    st.session_state.setdefault(
+        "cfg_output_lang_idx",
+        OUTPUT_LANGUAGES.index(lang) if lang in OUTPUT_LANGUAGES else 0,
+    )
 
 
 def _save_llm_config() -> None:
@@ -128,12 +165,101 @@ def _save_llm_config() -> None:
         val = st.session_state.get(key)
         if val:
             cfg[key] = val
+    cfg["max_tokens"] = int(st.session_state.get("cfg_max_tokens") or 0)
+    cfg["max_debate_rounds"] = int(st.session_state.get("cfg_debate_rounds") or 1)
+    cfg["max_risk_discuss_rounds"] = int(st.session_state.get("cfg_risk_rounds") or 1)
+    cfg["llm_timeout"] = int(st.session_state.get("cfg_llm_timeout") or 150)
+    lang_idx = int(st.session_state.get("cfg_output_lang_idx") or 0)
+    cfg["output_language"] = OUTPUT_LANGUAGES[lang_idx]
     # 持久化失败（目录只读 / 磁盘满）只记 warning，不得打断「开始分析」主流程
     try:
         _LLM_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         _LLM_CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
     except OSError as exc:
         logger.warning("LLM 配置持久化失败（不影响本次分析）: %s", exc)
+
+
+def _read_secrets() -> dict:
+    """读本机保存的 API Key 表（provider → key）。缺失/损坏一律当作空表。"""
+    try:
+        data = json.loads(_SECRETS_PATH.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_secrets(secrets: dict) -> None:
+    """写回本机 Key 表。失败只记 warning，不打断主流程。
+
+    权限收到 0600（Windows 上 chmod 语义有限，失败了也无所谓）：这是明文凭据文件，
+    不能让同机其它用户直接读。
+    """
+    try:
+        _SECRETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _SECRETS_PATH.write_text(
+            json.dumps(secrets, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        try:
+            os.chmod(_SECRETS_PATH, 0o600)
+        except OSError:
+            pass
+    except OSError as exc:
+        logger.warning("API Key 持久化失败（不影响本次分析）: %s", exc)
+
+
+def _mask_key(key: str) -> str:
+    """把 key 打码成 sk-12****3456 的形状，用于「已从 .env 读到」这类提示。"""
+    key = key.strip()
+    if len(key) <= 10:
+        return "*" * len(key)
+    return f"{key[:6]}****{key[-4:]}"
+
+
+def apply_stored_secrets() -> None:
+    """启动时把本机保存的 Key 注入环境变量。
+
+    `web/app.py` 在 `load_dotenv(override=True)` **之后**调用，所以网页里保存的 key
+    优先于 .env —— 用户在界面上填的应该是最终生效的那份，否则改了没反应会很难排查。
+    只注入非空值，避免把 .env 里正常的配置覆盖成空串。
+    """
+    for provider, key in _read_secrets().items():
+        env_name = _PROVIDER_KEY_ENV.get(provider)
+        if env_name and isinstance(key, str) and key.strip():
+            os.environ[env_name] = key.strip()
+
+
+def _current_key_for(provider: str) -> str:
+    """取某 provider 当前生效的 key：进程环境变量（含网页填写/已保存的）优先。"""
+    env_name = _PROVIDER_KEY_ENV.get(provider)
+    if not env_name:
+        return ""
+    return (os.environ.get(env_name) or "").strip()
+
+
+def validate_api_key(config: dict | None = None) -> str | None:
+    """拦住「没配 API Key」，在起线程之前给出可操作的提示。
+
+    与 `validate_model_selection` 一样挂在 `start_analysis` 的唯一消费点：
+    侧栏开始分析、未完成任务续跑、报告页重新分析、错误页继续，四条路径都过这里。
+    不拦的话，错误会在线程里以 `RuntimeError: 未找到 xxx 的 API Key` 出现，
+    而那时进度面板已经切过去了，用户看到的只是一句失败信息。
+    """
+    provider = str(
+        (config or {}).get("llm_provider")
+        or st.session_state.get("llm_provider")
+        or ""
+    ).strip().lower()
+    if provider == "ollama":
+        return None
+    env_name = _PROVIDER_KEY_ENV.get(provider)
+    if not env_name:
+        return None
+    if _current_key_for(provider):
+        return None
+    return (
+        f"还没配置 {provider} 的 API Key。请在侧栏「⚙️ 模型配置 → API Key」里填上"
+        f"（或在 .env 里设 `{env_name}=你的key`），然后重新点「开始分析」。"
+    )
 
 
 # Provider display names in recommended order
@@ -251,6 +377,123 @@ def _render_analysis_controls(raw_ticker: str, trade_date_value: date) -> None:
         st.caption("正在停止并清空，收尾完成后可重新开始。")
 
 
+def _render_api_key(provider_key: str) -> None:
+    """渲染 API Key 输入框：填写即生效，可选保存到本机。
+
+    输入框的 widget 键按 provider 分开（`api_key_input_<provider>`），切供应商时
+    各自保留已填内容。初次渲染用已保存的 key 预填，所以用户不用每次重新粘。
+    填了就**立刻**写进环境变量——不必先按保存，因为「开始分析」可能在同一次
+    rerun 里就发起，等保存按钮就晚了。
+    """
+    env_name = _PROVIDER_KEY_ENV.get(provider_key)
+    if not env_name:
+        st.caption("Ollama 是本地模型，不需要 API Key。")
+        return
+
+    widget_key = f"api_key_input_{provider_key}"
+    saved = _read_secrets().get(provider_key, "")
+    if widget_key not in st.session_state:
+        st.session_state[widget_key] = saved
+
+    typed = st.text_input(
+        "API Key",
+        key=widget_key,
+        type="password",
+        placeholder="sk-...",
+        help=(
+            f"填好后会写入当前会话（{env_name}），点「开始分析」即生效。"
+            "也可以点「保存到本机」持久化，下次打开自动带出。"
+            "不填则沿用 .env 里已有的同名变量。"
+        ),
+    ).strip()
+
+    if typed:
+        os.environ[env_name] = typed
+
+    effective = _current_key_for(provider_key)
+    if typed:
+        st.caption(f"✅ 已使用页面填写的 Key（{_mask_key(typed)}）")
+    elif effective:
+        st.caption(f"✅ 使用 .env 中的 `{env_name}`（{_mask_key(effective)}）")
+    else:
+        st.caption(f"⚠️ 未检测到 Key：请在上方填写，或在 .env 设 `{env_name}`。")
+
+    save_col, clear_col = st.columns(2)
+    if save_col.button(
+        "保存到本机", key=f"save_key_{provider_key}", use_container_width=True
+    ):
+        secrets = _read_secrets()
+        if typed:
+            secrets[provider_key] = typed
+            _write_secrets(secrets)
+            st.success("已保存，下次打开自动带出。")
+        else:
+            st.warning("输入框是空的，没有可保存的 Key。")
+    if clear_col.button(
+        "清除", key=f"clear_key_{provider_key}", use_container_width=True
+    ):
+        secrets = _read_secrets()
+        secrets.pop(provider_key, None)
+        _write_secrets(secrets)
+        st.session_state[widget_key] = ""
+        os.environ.pop(env_name, None)
+        st.rerun()
+
+
+def _render_advanced_params() -> None:
+    """渲染高级参数（折叠）：输出上限、辩论轮数、超时、输出语言。
+
+    每项的默认值就是 DEFAULT_CONFIG 里的值，不碰也完全等同原行为；
+    只有「报告写到一半被截断」「想加深辩论」这类场景才需要调。
+    """
+    with st.expander("🔧 高级参数", expanded=False):
+        st.number_input(
+            "单次回复最大输出 token（0 = 用模型默认）",
+            min_value=0,
+            max_value=200000,
+            step=1000,
+            key="cfg_max_tokens",
+            help=(
+                "报告写到一半就断，通常撞的就是这个输出上限，不是上下文超长。"
+                "截断时日志里会有「因为达到输出上限被截断」的提示，调大到 16000 往往就够。"
+            ),
+        )
+        st.number_input(
+            "多空辩论轮数",
+            min_value=1,
+            max_value=5,
+            step=1,
+            key="cfg_debate_rounds",
+            help="Bull 与 Bear 来回辩论的轮数，轮数越多越慢、消耗越多。",
+        )
+        st.number_input(
+            "风险三方辩论轮数",
+            min_value=1,
+            max_value=5,
+            step=1,
+            key="cfg_risk_rounds",
+            help="激进 / 保守 / 中立三方讨论的轮数。",
+        )
+        st.number_input(
+            "单次 LLM 请求超时（秒）",
+            min_value=30,
+            max_value=1800,
+            step=10,
+            key="cfg_llm_timeout",
+            help=(
+                "防止请求挂起导致分析永久卡住。深度推理模型经常在吐首个 token 前"
+                "就超时的话，把它调大。"
+            ),
+        )
+        st.selectbox(
+            "报告输出语言",
+            range(len(OUTPUT_LANGUAGES)),
+            format_func=lambda i: OUTPUT_LANGUAGES[i],
+            key="cfg_output_lang_idx",
+            help="仅影响报告语言，内部辩论始终英文以保证推理质量。",
+        )
+
+
 def _render_llm_config() -> None:
     """Render LLM provider and model selection controls."""
 
@@ -318,8 +561,11 @@ def _render_llm_config() -> None:
     if base_url_required:
         st.caption(
             "已选「OpenAI 兼容（自定义）」：**Base URL 必填**（你的网关，走标准 Chat "
-            "Completions），模型 ID 手动填写，Key 在 .env 设 `OPENAI_COMPATIBLE_API_KEY`。"
+            "Completions），模型 ID 手动填写，Key 填在下方。"
         )
+
+    _render_api_key(provider_key)
+    _render_advanced_params()
 
     # ── 个人 Claude 订阅额度（可选，仅个人自用）────────────────────────
     _scope_labels = [

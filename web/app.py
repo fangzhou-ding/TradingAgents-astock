@@ -22,10 +22,19 @@ from tradingagents.default_config import DEFAULT_CONFIG  # noqa: E402
 
 from web.components.progress_panel import render_progress  # noqa: E402
 from web.components.report_viewer import render_report  # noqa: E402
-from web.components.sidebar import render_sidebar, validate_model_selection  # noqa: E402
+from web.components.sidebar import (  # noqa: E402
+    apply_stored_secrets,
+    render_sidebar,
+    validate_api_key,
+    validate_model_selection,
+)
 from web.history import clear_incomplete_task, extract_signal, load_analysis  # noqa: E402
 from web.progress import ProgressTracker  # noqa: E402
 from web.runner import run_analysis_in_thread  # noqa: E402
+
+# 网页里保存的 API Key 注入环境变量。必须在 load_dotenv 之后：界面上填的 key
+# 应当是最终生效的那份，否则用户改了 Key 却没反应，排查起来毫无头绪。
+apply_stored_secrets()
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -173,10 +182,19 @@ def _build_config() -> dict:
     }
     # Analysis window (#16): start-date input in the sidebar → look-back days.
     config["market_lookback_days"] = st.session_state.get("market_lookback_days")
-    config["max_debate_rounds"] = 1
-    config["max_risk_discuss_rounds"] = 1
+    # Advanced parameters from the sidebar's 「🔧 高级参数」 expander (v0.5.22).
+    # 0 / 缺省即「用默认值」，所以不碰这些控件时行为与之前完全一致。
+    max_tokens = int(st.session_state.get("cfg_max_tokens") or 0)
+    if max_tokens > 0:
+        config["max_tokens"] = max_tokens
+    config["max_debate_rounds"] = int(st.session_state.get("cfg_debate_rounds") or 1)
+    config["max_risk_discuss_rounds"] = int(st.session_state.get("cfg_risk_rounds") or 1)
+    config["llm_timeout"] = int(st.session_state.get("cfg_llm_timeout") or 150)
+    lang_idx = int(st.session_state.get("cfg_output_lang_idx") or 0)
+    from web.components.sidebar import OUTPUT_LANGUAGES
+
+    config["output_language"] = OUTPUT_LANGUAGES[lang_idx] if lang_idx < len(OUTPUT_LANGUAGES) else "Chinese"
     config["checkpoint_enabled"] = True
-    config["output_language"] = "Chinese"
     # Optional: route nodes through a personal Claude Pro/Max subscription (Agent
     # SDK). Scope: "deep" = Research/Portfolio only; "all" = + the 7 analysts.
     # Leaving the fallback keys None makes the graph fall back to the
@@ -213,8 +231,14 @@ if start_req:
     # 校验的是 `_build_config()` 的产物，也就是真正要发出去的那份配置。
     config = _build_config()
     model_error = validate_model_selection(config)
+    # Key 校验同样挂在这唯一的消费点：四条路径（开始分析 / 续跑 / 重新分析 /
+    # 继续未完成任务）都会经过这里；只在侧栏按钮里守，其余三条照样会把请求打出去，
+    # 然后在后台线程里以一句看不懂的 RuntimeError 失败。
+    key_error = validate_api_key(config)
     if model_error:
         st.error(f"❌ {model_error}")
+    elif key_error:
+        st.error(f"❌ {key_error}")
     else:
         if start_req.get("fresh"):
             from tradingagents.graph.checkpointer import clear_checkpoint
